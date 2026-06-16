@@ -508,7 +508,6 @@ pub fn execute_plan(
     run_opts: &RunOptions,
 ) -> Answer {
     let mut step_results: Vec<StepResult> = Vec::new();
-    let mut clarify_needed = false;
     let mut clarify_question_out: Option<String> = None;
     let mut binding_conf: f64 = 1.0;
     let question = &plan.question;
@@ -562,7 +561,6 @@ pub fn execute_plan(
             });
 
             if verdict == Verdict::ClarifyNeeded {
-                clarify_needed = true;
                 // Halt — return partial answer with clarify_needed
                 return Answer {
                     question: question.clone(),
@@ -601,8 +599,13 @@ pub fn execute_plan(
         }
     }
 
+    // Determine if a clarify was needed from the step results
+    let clarify_fired = step_results
+        .iter()
+        .any(|r| r.pillar == "clarify" && r.verdict == Verdict::ClarifyNeeded);
+
     // Build the final answer
-    let final_answer = if clarify_needed {
+    let final_answer = if clarify_fired {
         None
     } else {
         // Look for answer from rosetta-credential step
@@ -622,7 +625,7 @@ pub fn execute_plan(
         model: model.clone(),
         plan: plan.steps.clone(),
         step_results,
-        clarify_needed,
+        clarify_needed: clarify_fired,
         clarify_question: clarify_question_out,
         clarify_answer: run_opts.clarify_answer.clone(),
         final_answer,
