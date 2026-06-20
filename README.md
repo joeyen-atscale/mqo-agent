@@ -1,42 +1,12 @@
 # mqo-agent
 
-Adaptive reference agent that plans which MQO pillars to call for any NL question.
+A deterministic planner that, given one natural-language question, decides which MQO pillar tools to call and in what order — then runs them and emits a signed answer.
 
-## TL;DR
+## Why it exists
 
-`mqo-demo-runner` proves the pillars compose — but only for a fixed, scripted question walking a hard-coded pillar order. A real AI agent over the semantic layer is handed an *arbitrary* NL question and must **decide**: does this need a clarify round? does it mention YoY so time-intelligence fires? is the bind confident enough to skip disambiguation? `mqo-agent` is that decision-maker — a deterministic planner that, given one NL question, selects which pillar tools to invoke and in what order, loops on clarify, and stops with a defensible answer.
+`mqo-demo-runner` proves the MQO pillars compose, but only for a fixed, scripted question walking a hard-coded pillar order. A real agent over the semantic layer is handed an *arbitrary* question and has to decide for itself: does this need a clarify round? Does it mention year-over-year, so time-intelligence has to fire? Is the model on more than one engine, so the answer needs a parity check? Is the column binding confident enough to skip disambiguation entirely?
 
-## Usage
-
-```sh
-# Plan which pillars would fire (audit without executing)
-mqo-agent plan "Show me revenue YoY by EMEA region" --model internet_sales
-
-# Ask a question (mock mode — no sibling binaries needed)
-mqo-agent ask "What are total sales by category?" --model tasty_bytes --mock
-
-# Ask with disambiguation
-mqo-agent ask "Revenue stuff" --model tasty_bytes --mock
-# If clarify_needed, re-run with:
-mqo-agent ask "Revenue stuff" --model tasty_bytes --mock --answer "revenue by product category"
-
-# Show the planner rule table
-mqo-agent rules
-
-# Run as MCP subprocess server (stdin/stdout JSON)
-mqo-agent serve
-```
-
-## Acceptance Criteria
-
-1. `plan "<question with YoY>"` includes a time-intelligence step with a recorded reason; `plan "<question without period tokens>"` omits it.
-2. `plan` against a multi-engine model includes an engine-parity step; against a single-engine model it does not.
-3. `ask … --mock` executes exactly the planned steps in planned order and emits `answer.json` with per-step verdicts and a final answer; no unplanned pillar runs.
-4. A low-confidence bind yields `clarify_needed` + a question and does NOT fabricate a final answer; `ask … --answer <x>` resumes and completes deterministically.
-5. sensitivity-scan always appears before the final answer in any non-clarify plan; rosetta-credential is always the terminal step of a completed answer.
-6. The planner rule table is a readable bundled config; `--help` documents every subcommand/flag.
-7. Determinism: identical `plan` and `--mock ask` output across runs (timings excluded from equality).
-8. `serve` answers `mqo-mcp-server` `ask` and `plan` tool calls over stdin/stdout; the full mock test runs with no network and no sibling binaries installed.
+`mqo-agent` is that decision-maker. The same question always produces the same plan, the same plan always runs the same way, and every selection carries a recorded reason — so the routing is auditable before a single query fires. It is the reference for how an agent should reason about the pillars, not a finished production agent.
 
 ## Install
 
@@ -44,21 +14,86 @@ mqo-agent serve
 cargo install --path .
 ```
 
-Requires Rust 1.85+. External pillar CLIs (`mqo-catalog-embed`, `mqo-binding-confidence`, etc.) are resolved from PATH — use `--mock` for offline/CI testing when they are not installed.
+Requires Rust 1.85+.
 
-## Planner Rules
+## Quickstart
 
-The planner is fully deterministic and documented. Run `mqo-agent rules` to see the full rule table. In brief:
+The fastest way to see what it does is to plan a question without running anything:
+
+```sh
+mqo-agent plan "Show me revenue YoY by EMEA region" --model internet_sales
+```
+
+```
+Plan for: Show me revenue YoY by EMEA region
+Model:    internet_sales
+Planner:  deterministic
+
+   1. catalog-embed         mqo-catalog-embed
+      Reason: Always first: embed question against semantic catalog to identify relevant columns.
+   2. binding-confidence    mqo-binding-confidence
+      Reason: Always second: score column binding confidence to determine if clarification is needed.
+   3. clarify               mqo-clarify
+      Reason: Conditional: fires if binding-confidence < 0.45; emits a clarify question and halts until --answer is provided.
+   4. time-intelligence     mqo-time-intelligence
+      Reason: Period-over-period tokens detected in question: yoy
+   5. engine-parity         mqo-engine-parity
+      Reason: Model 'internet_sales' is registered on multiple query engines; engine-parity ensures consistent results across them.
+   6. sensitivity-scan      mqo-sensitivity-scan
+      Reason: Always penultimate: scan for PII or forbidden field leakage before returning.
+   7. rosetta-credential    rosetta-credential
+      Reason: Always terminal: sign the final answer with provenance.
+```
+
+Drop `time-intelligence` by asking a question with no period tokens; drop `engine-parity` by pointing at a single-engine model like `tasty_bytes`.
+
+To execute a plan, use `ask`. The pillar steps shell out to sibling binaries on `PATH`; when those aren't installed, `--mock` runs the whole chain against canned fixtures with no network and no siblings — the mode used in CI:
+
+```sh
+mqo-agent ask "What are total sales by category?" --model tasty_bytes --mock
+```
+
+This emits `answer.json` to stdout (or to `--out FILE`): the plan, a per-step verdict (`ok` / `skipped` / `clarify_needed` / `failed`), each step's raw output, and a final signed answer.
+
+When the column binding is low-confidence, the agent stops rather than guess:
+
+```sh
+mqo-agent ask "Revenue stuff" --model tasty_bytes --mock
+# → clarify_needed, with a question; no final answer is fabricated.
+
+# Resume deterministically with the disambiguation:
+mqo-agent ask "Revenue stuff" --model tasty_bytes --mock --answer "revenue by product category"
+```
+
+## How it works
+
+The planner walks one rule table. Two steps are unconditional bookends; the middle is gated on the question and the model:
 
 | Step | When |
 |------|------|
-| catalog-embed | Always first |
-| binding-confidence | Always second |
-| clarify | If confidence < 0.45 (and no `--answer` already given) |
-| time-intelligence | If question contains YoY/QoQ/MoM/YTD/etc. tokens |
-| engine-parity | If the model is registered on >1 query engine |
-| sensitivity-scan | Always penultimate |
-| rosetta-credential | Always terminal |
+| catalog-embed | Always first — embed the question against the semantic catalog |
+| binding-confidence | Always second — score how well columns bind to the question |
+| clarify | If binding-confidence < 0.45 — halt and ask, unless `--answer` was already supplied |
+| time-intelligence | If the question contains period tokens (yoy, qoq, mom, ytd, "year over year", "prior quarter", …) |
+| engine-parity | If the model is registered on more than one query engine |
+| sensitivity-scan | Always penultimate — scan for PII or forbidden-field leakage |
+| rosetta-credential | Always terminal — sign the answer with provenance |
+
+`plan` shows which steps would fire and why without running them. `ask` runs them in that order — and only those; the clarify gate is the one place a confidence score, not the question text, decides the path. The rule table is bundled and printable:
+
+```sh
+mqo-agent rules
+```
+
+`mqo-agent serve` runs the same logic as a subprocess MCP server, reading newline-delimited JSON tool calls (`{"tool": "plan", ...}` / `{"tool": "ask", ...}`) on stdin and writing JSON responses on stdout.
+
+## Where it fits
+
+Part of the MQO line. `mqo-mcp` serves the semantic layer; the individual pillars (`mqo-catalog-embed`, `mqo-binding-confidence`, `mqo-time-intelligence`, and the rest) are the tools this agent orchestrates; `mqo-demo-runner` is the scripted predecessor that this generalizes from a fixed path to an arbitrary question.
+
+## Status
+
+The planner and the `--mock` execution path are complete and covered by tests against the acceptance criteria (period-token routing, engine-parity gating, the clarify halt-and-resume, step ordering, determinism, and the `serve` contract). Live execution depends on the pillar binaries being present on `PATH`; absent ones are reported as `skipped` rather than failing the run, so end-to-end results are only as real as the siblings you have installed. The `--planner brain` variant is exposed but not yet wired — it currently produces the same deterministic plan as the default.
 
 ## License
 
